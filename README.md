@@ -241,8 +241,8 @@
 ۱. **کلون کردن مخزن:**
 
    ```bash
-   git clone https://github.com/amirhosseinnazafat/Telegram-Strategic-GameBot.git
-   cd Telegram-Strategic-GameBot
+   git clone https://github.com/amirhosseinnazafat/RUBIKA-WAR-TXT
+   cd RUBIKA-WAR-TXT
 
 ##!
 </p>
