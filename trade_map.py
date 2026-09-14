@@ -26,7 +26,7 @@ chokepoint_owners.node_id و کلیدهای toll_<id> در trade_config مطاب
 این تفکیک به ادمین اجازه می‌دهد بگوید «سوئز به دریای سرخ ۴۰ دقیقه طول می‌کشد»
 بدون اینکه قیمتی را جابه‌جا کند.
 
-نسخه روبیکا — بدون وابستگی به تلگرام.
+نسخه روبیکا — کاملاً مستقل از کتابخانه پیام‌رسان.
 """
 
 import re
@@ -229,6 +229,7 @@ def _migrate():
             minutes INTEGER NOT NULL DEFAULT 0,
             UNIQUE (mode, a, b)
         )''')
+        # بدون این، حذف چیزی که بازی با آن عرضه شد، خودش را در ری‌استارت بعدی برمی‌گرداند.
         _conn.execute('''CREATE TABLE IF NOT EXISTS trade_map_removed (
             kind TEXT NOT NULL,
             ref  TEXT NOT NULL,
@@ -300,13 +301,26 @@ def _tombstone(kind, ref):
 
 
 def _invalidate():
-    """حذف lookup های مشتق‌شده. هر mutator با این تمام می‌شود."""
+    """حذف lookup های مشتق‌شده. هر mutator با این تمام می‌شود.
+
+    خواننده‌ها از طریق nodes()/edges()/adjacency() می‌گذرند که اینجا
+    memoize می‌کنند نه در caller، پس این تنها جایی است که نقشه کهنه
+    می‌تواند پنهان شود.
+    """
     with _lock:
         _cache.clear()
 
 
 def _cached(key, build):
-    """Memoize یک lookup مشتق‌شده، با نگه‌داشتن قفل در طول build و store."""
+    """Memoize یک lookup مشتق‌شده، با نگه‌داشتن قفل در طول build و store.
+
+    thread ticker مربوط به trade_system نقشه را می‌خواند در حالی که ادمین
+    آن را ویرایش می‌کند. interleaving خطرناک خواندن پاره نیست — بلکه خواننده‌ای
+    است که مقداری می‌سازد، _invalidate() زیرش اجرا می‌شود، و بعد مقدار
+    کهنه‌اش را در کش می‌نویسد، جایی که تا ویرایش بعدی می‌ماند. ساخت زیر
+    همان قفلی که mutator ها می‌گیرند این را غیرممکن می‌کند. قفل reentrant
+    است و _q() از قبل آن را می‌گیرد، پس build می‌تواند آزادانه query بزند.
+    """
     with _lock:
         if key not in _cache:
             _cache[key] = build()
@@ -314,7 +328,11 @@ def _cached(key, build):
 
 
 def set_node_guard(fn):
-    """ثبت آن‌چه تعیین می‌کند یک گره برای حذف خیلی شلوغ است."""
+    """ثبت آن‌چه تعیین می‌کند یک گره برای حذف خیلی شلوغ است.
+
+    fn شناسه گره‌هایی را برمی‌گرداند که یک تجارت در جریان هنوز باید از آن‌ها
+    عبور کند. حذف یکی، آن محموله را در میانه مسیر رها می‌کند.
+    """
     global _node_guard
     _node_guard = fn
 
@@ -338,33 +356,40 @@ def check_new_id(nid):
     """خطای MapError مگر آن‌که nid شناسه‌ای قابل استفاده برای گره جدید باشد."""
     _check_id(nid)
     if _q("SELECT 1 FROM trade_nodes WHERE id=?", (nid,)):
-        raise MapError('id_taken')
+        raise MapError('exists')
     return nid
 
 
 # ---------------------------------------------------------------------------
-# خواندن نقشه
+# خواندن
 # ---------------------------------------------------------------------------
 
 
-def nodes(mode=None):
-    """تمام شناسه‌های گره، اختیاری فیلتر شده بر اساس mode."""
-    if mode is None:
-        rows = _q("SELECT id FROM trade_nodes ORDER BY mode, position")
-    else:
-        if mode not in MODES:
-            raise MapError('bad_mode')
-        rows = _q("SELECT id FROM trade_nodes WHERE mode=? ORDER BY position", (mode,))
-    return tuple(r['id'] for r in rows)
+def nodes(mode):
+    """{node id: {'kind', 'home', 'names'}} برای یک mode، به ترتیب لیست ادمین.
+
+    دقیقاً شکل literal ای که قبلاً در trade_system بود، پس کد routing آن را
+    همان‌طور که همیشه می‌خواند، می‌خواند.
+    """
+    if mode not in MODES:
+        raise MapError('bad_mode')
+
+    def build():
+        labels = {}
+        for row in _q("SELECT node_id, lang, label FROM trade_node_labels"):
+            labels.setdefault(row['node_id'], {})[row['lang']] = row['label']
+        out = {}
+        for row in _q("SELECT id, kind, home FROM trade_nodes WHERE mode=? ORDER BY position, id",
+                      (mode,)):
+            out[row['id']] = {'kind': row['kind'], 'home': bool(row['home']),
+                              'names': labels.get(row['id'], {})}
+        return out
+
+    return _cached(('nodes', mode), build)
 
 
 def node(mode, nid):
-    if mode not in MODES:
-        raise MapError('bad_mode')
-    rows = _q("SELECT * FROM trade_nodes WHERE id=? AND mode=?", (nid, mode))
-    if not rows:
-        raise MapError('unknown_node')
-    return rows[0]
+    return nodes(mode).get(nid)
 
 
 def mode_of(nid):
@@ -372,177 +397,229 @@ def mode_of(nid):
     return rows[0]['mode'] if rows else None
 
 
-def kind_of(nid):
-    rows = _q("SELECT kind FROM trade_nodes WHERE id=?", (nid,))
-    return rows[0]['kind'] if rows else None
-
-
-def labels(nid):
-    return {r['lang']: r['label'] for r in
-            _q("SELECT lang, label FROM trade_node_labels WHERE node_id=?", (nid,))}
-
-
-def name(nid, lang='fa'):
+def name(nid, lang):
+    """نام نمایشی یک گره، با fallback به زبان دیگر و در نهایت id آن."""
     rows = _q("SELECT label FROM trade_node_labels WHERE node_id=? AND lang=?", (nid, lang))
     if rows:
         return rows[0]['label']
-    rows = _q("SELECT label FROM trade_node_labels WHERE node_id=? AND lang='en'", (nid,))
+    rows = _q("SELECT label FROM trade_node_labels WHERE node_id=? LIMIT 1", (nid,))
     return rows[0]['label'] if rows else nid
 
 
-def chokepoints(mode=None):
-    """گره‌هایی که عوارض می‌گیرند — تنگه، کانال، گذرگاه."""
-    placeholders = ','.join('?' * len(CHOKEPOINT_KINDS))
-    sql = f"SELECT id FROM trade_nodes WHERE kind IN ({placeholders})"
-    params = list(CHOKEPOINT_KINDS)
-    if mode:
-        sql += " AND mode=?"
-        params.append(mode)
-    sql += " ORDER BY mode, position"
-    return tuple(r['id'] for r in _q(sql, params))
-
-
-def _edges(mode):
-    if mode not in MODES:
-        raise MapError('bad_mode')
-    return _q("SELECT a, b, units, minutes FROM trade_edges WHERE mode=? ORDER BY id", (mode,))
+def labels(nid):
+    return {row['lang']: row['label']
+            for row in _q("SELECT lang, label FROM trade_node_labels WHERE node_id=?", (nid,))}
 
 
 def edges(mode):
-    """(a, b, units, minutes) برای هر یال."""
-    return tuple((r['a'], r['b'], r['units'], r['minutes']) for r in _edges(mode))
+    """[(a, b, units, minutes)] برای یک mode."""
+    if mode not in MODES:
+        raise MapError('bad_mode')
+    return _cached(('edges', mode), lambda: [
+        (row['a'], row['b'], row['units'], row['minutes'])
+        for row in _q("SELECT a, b, units, minutes FROM trade_edges WHERE mode=? "
+                      "ORDER BY a, b", (mode,))])
+
+
+def edge(mode, a, b):
+    a, b = _pair(a, b)
+    rows = _q("SELECT a, b, units, minutes FROM trade_edges WHERE mode=? AND a=? AND b=?",
+              (mode, a, b))
+    return rows[0] if rows else None
 
 
 def edges_of(nid):
-    """تمام یال‌هایی که به یک گره وصل هستند."""
-    return _q("SELECT a, b, units, minutes FROM trade_edges WHERE a=? OR b=?", (nid, nid))
-
-
-def leg(mode, a, b):
-    """(units, minutes) برای یال بین دو گره، یا None."""
-    if mode not in MODES:
-        raise MapError('bad_mode')
-    a, b = _pair(a, b)
-    rows = _q("SELECT units, minutes FROM trade_edges WHERE mode=? AND a=? AND b=?",
-              (mode, a, b))
-    return (rows[0]['units'], rows[0]['minutes']) if rows else None
+    """هر یالی که یک گره را لمس می‌کند، از هر سر که باشد."""
+    return _q("SELECT mode, a, b, units, minutes FROM trade_edges WHERE a=? OR b=? ORDER BY a, b",
+              (nid, nid))
 
 
 def adjacency(mode):
-    """دیکشنری: nid -> [(همسایه, واحد), ...]"""
+    """{node id: [(neighbour, units)]}، هر گره حتی بدون یال حاضر است."""
     def build():
-        adj = {nid: [] for nid in nodes(mode)}
+        out = {nid: [] for nid in nodes(mode)}
         for a, b, units, _minutes in edges(mode):
-            adj[a].append((b, units))
-            adj[b].append((a, units))
-        return adj
-    return _cached('adj_' + mode, build)
+            if a in out and b in out:
+                out[a].append((b, units))
+                out[b].append((a, units))
+        return out
+
+    return _cached(('adj', mode), build)
+
+
+def leg(mode, a, b):
+    """(units, minutes) برای یک پای، یا None وقتی دو سر وصل نیستند."""
+    legs = _cached(('legs', mode), lambda: {frozenset((x, y)): (units, minutes)
+                                            for x, y, units, minutes in edges(mode)})
+    return legs.get(frozenset((a, b)))
+
+
+def leg_minutes(mode, a, b, per_unit):
+    """چقدر یک پای طول می‌کشد: override وقتی تنظیم شده، وگرنه units x per_unit."""
+    found = leg(mode, a, b)
+    if found is None:
+        return 0
+    units, minutes = found
+    return minutes if minutes > 0 else units * per_unit
+
+
+def chokepoints():
+    """هر گرهی که می‌توان در آن عوارض گرفت، اول دریا بعد خشکی."""
+    out = []
+    for mode in MODES:
+        out += [nid for nid, n in nodes(mode).items() if n['kind'] in CHOKEPOINT_KINDS]
+    return out
+
+
+def home_nodes(mode):
+    return [nid for nid, n in nodes(mode).items() if n['home']]
 
 
 # ---------------------------------------------------------------------------
-# نوشتن نقشه
+# نوشتن — گره‌ها
 # ---------------------------------------------------------------------------
 
 
-def set_labels(nid, labels_dict):
+def add_node(mode, nid, kind, home, label_map):
+    if mode not in MODES:
+        raise MapError('bad_mode')
+    _check_id(nid)
+    if kind not in KINDS[mode]:
+        raise MapError('bad_kind')
+    if _q("SELECT 1 FROM trade_nodes WHERE id=?", (nid,)):
+        raise MapError('exists')
     with _lock:
-        for lang, text in labels_dict.items():
-            if lang not in LANGS:
-                continue
-            _conn.execute("INSERT OR REPLACE INTO trade_node_labels (node_id, lang, label) "
-                          "VALUES (?, ?, ?)", (nid, lang, text))
+        rows = _q("SELECT COALESCE(MAX(position), 0) AS p FROM trade_nodes WHERE mode=?", (mode,))
+        position = (rows[0]['p'] if rows else 0) + 10
+        _conn.execute("INSERT INTO trade_nodes (id, mode, kind, home, position, builtin) "
+                      "VALUES (?, ?, ?, ?, ?, 0)",
+                      (nid, mode, kind, 1 if home else 0, position))
+        # گره‌ای که یک بار حذف و دوباره اضافه شده باید این بار بماند.
+        _conn.execute("DELETE FROM trade_map_removed WHERE kind='node' AND ref=?", (nid,))
+        _conn.commit()
+    set_labels(nid, label_map)
+    _invalidate()
+    return nid
+
+
+def set_labels(nid, label_map):
+    _require_node(nid)
+    rows = [(nid, lang, text) for lang, text in label_map.items() if text]
+    if not rows:
+        return
+    with _lock:
+        _conn.executemany(
+            "INSERT OR REPLACE INTO trade_node_labels (node_id, lang, label) VALUES (?, ?, ?)",
+            rows)
         _conn.commit()
     _invalidate()
 
 
 def set_kind(nid, kind):
-    mode = mode_of(nid)
-    if mode is None:
-        raise MapError('unknown_node')
-    if kind not in KINDS[mode]:
+    row = _require_node(nid)
+    if kind not in KINDS[row['mode']]:
         raise MapError('bad_kind')
     _exec("UPDATE trade_nodes SET kind=? WHERE id=?", (kind, nid))
     _invalidate()
 
 
-def set_home(nid, value):
-    _exec("UPDATE trade_nodes SET home=? WHERE id=?", (1 if value else 0, nid))
-    _invalidate()
-
-
-def set_edge(mode, a, b, units=None, minutes=None):
-    if mode not in MODES:
-        raise MapError('bad_mode')
-    a, b = _pair(a, b)
-    if a == b:
-        raise MapError('self_edge')
-    for nid in (a, b):
-        if not _q("SELECT 1 FROM trade_nodes WHERE id=? AND mode=?", (nid, mode)):
-            raise MapError('unknown_node')
-    current = leg(mode, a, b)
-    new_units = units if units is not None else (current[0] if current else 1)
-    new_minutes = minutes if minutes is not None else (current[1] if current else 0)
-    if new_units < 1:
-        raise MapError('bad_units')
-    with _lock:
-        _conn.execute("INSERT OR REPLACE INTO trade_edges (mode, a, b, units, minutes) "
-                      "VALUES (?, ?, ?, ?, ?)", (mode, a, b, int(new_units), int(new_minutes)))
-        _conn.commit()
-    _invalidate()
-
-
-def add_node(mode, nid, kind, home=False, names=None, position=None):
-    if mode not in MODES:
-        raise MapError('bad_mode')
-    check_new_id(nid)
-    if kind not in KINDS[mode]:
-        raise MapError('bad_kind')
-    if position is None:
-        rows = _q("SELECT MAX(position) AS p FROM trade_nodes WHERE mode=?", (mode,))
-        position = ((rows[0]['p'] or 0) + 10) if rows else 10
-    with _lock:
-        _conn.execute("INSERT INTO trade_nodes (id, mode, kind, home, position, builtin) "
-                      "VALUES (?, ?, ?, ?, ?, 0)",
-                      (nid, mode, kind, 1 if home else 0, position))
-        for lang, text in (names or {}).items():
-            if lang in LANGS:
-                _conn.execute("INSERT INTO trade_node_labels (node_id, lang, label) "
-                              "VALUES (?, ?, ?)", (nid, lang, text))
-        _conn.commit()
+def set_home(nid, home):
+    _require_node(nid)
+    _exec("UPDATE trade_nodes SET home=? WHERE id=?", (1 if home else 0, nid))
     _invalidate()
 
 
 def remove_node(nid):
-    """حذف یک گره و تمام یال‌هایش، با tombstone برای گره‌های builtin."""
-    mode = mode_of(nid)
-    if mode is None:
-        raise MapError('unknown_node')
-    busy = nodes_in_transit()
-    if nid in busy:
+    """حذف یک گره، برچسب‌هایش، یال‌هایش و هر ارجاع به آن.
+
+    تا وقتی یک تجارت در جریان هنوز باید از آن عبور کند، رد می‌کند — ticker
+    آن مسیر ذخیره‌شده را پای به پای می‌پیماید و هر گره را نام می‌برد.
+
+    شناسه گره از سه جای بیرون این جدول‌های ما ارجاع داده می‌شود، و ارجاع
+    آویزان بدتر از گره گمشده است: کشوری که home_sea اش به هیچ اشاره می‌کند
+    به سادگی نمی‌تواند تجارت کند، بدون خطایی که توضیح دهد چرا. پس اینجا
+    پاک می‌شوند، در همان تراکنش حذف.
+    """
+    _require_node(nid)
+    if nid in nodes_in_transit():
         raise MapError('in_transit')
     with _lock:
         _conn.execute("DELETE FROM trade_edges WHERE a=? OR b=?", (nid, nid))
         _conn.execute("DELETE FROM trade_node_labels WHERE node_id=?", (nid,))
-        rows = _q("SELECT builtin FROM trade_nodes WHERE id=?", (nid,))
-        builtin = bool(rows and rows[0]['builtin'])
         _conn.execute("DELETE FROM trade_nodes WHERE id=?", (nid,))
-        if builtin:
-            _tombstone('node', nid)
+        for statement, params in (
+                ("UPDATE users SET home_sea='' WHERE home_sea=?", (nid,)),
+                ("UPDATE users SET home_land='' WHERE home_land=?", (nid,)),
+                ("DELETE FROM chokepoint_owners WHERE node_id=?", (nid,)),
+                # صفر شده نه حذف: trade_config به CONFIG_DEFAULTS عرضه‌شده
+                # برمی‌گردد، پس ردیف حذف‌شده عوارض قدیمی را برمی‌گرداند —
+                # و در ری‌استارت بعدی دوباره seed می‌شود.
+                ("INSERT OR REPLACE INTO trade_config (key, value) VALUES (?, 0)",
+                 ('toll_' + nid,))):
+            try:
+                _conn.execute(statement, params)
+            except sqlite3.OperationalError:
+                # آن جدول‌ها به trade_system تعلق دارند. وقتی نقشه تنها
+                # استفاده می‌شود، آن‌ها غایب‌اند، و چیزی برای پاک کردن نیست.
+                pass
         _conn.commit()
+    _tombstone('node', nid)
+    _invalidate()
+
+
+# ---------------------------------------------------------------------------
+# نوشتن — یال‌ها
+# ---------------------------------------------------------------------------
+
+
+def add_edge(mode, a, b, units, minutes=0):
+    if mode not in MODES:
+        raise MapError('bad_mode')
+    if a == b:
+        raise MapError('self_edge')
+    for nid in (a, b):
+        row = _require_node(nid)
+        if row['mode'] != mode:
+            raise MapError('mode_mismatch')
+    if int(units) <= 0:
+        raise MapError('bad_units')
+    a, b = _pair(a, b)
+    if edge(mode, a, b):
+        raise MapError('edge_exists')
+    _exec("INSERT INTO trade_edges (mode, a, b, units, minutes) VALUES (?, ?, ?, ?, ?)",
+          (mode, a, b, int(units), max(0, int(minutes))))
+    _exec("DELETE FROM trade_map_removed WHERE kind='edge' AND ref=?", (_edge_ref(mode, a, b),))
+    _invalidate()
+
+
+def set_edge(mode, a, b, units=None, minutes=None):
+    """یک پای را دوباره تنظیم کن. units کارمزد و routing را می‌راند، minutes زمانش را override می‌کند."""
+    a, b = _pair(a, b)
+    row = edge(mode, a, b)
+    if row is None:
+        raise MapError('no_edge')
+    if units is not None:
+        if int(units) <= 0:
+            raise MapError('bad_units')
+        _exec("UPDATE trade_edges SET units=? WHERE mode=? AND a=? AND b=?",
+              (int(units), mode, a, b))
+    if minutes is not None:
+        _exec("UPDATE trade_edges SET minutes=? WHERE mode=? AND a=? AND b=?",
+              (max(0, int(minutes)), mode, a, b))
     _invalidate()
 
 
 def remove_edge(mode, a, b):
-    if mode not in MODES:
-        raise MapError('bad_mode')
     a, b = _pair(a, b)
-    if leg(mode, a, b) is None:
-        raise MapError('unknown_edge')
-    with _lock:
-        rows = _q("SELECT 1 FROM trade_edges WHERE mode=? AND a=? AND b=? AND "
-                  "(SELECT COUNT(*) FROM trade_edges WHERE mode=? AND a=? AND b=?) >= 1",
-                  (mode, a, b, mode, a, b))
-        _conn.execute("DELETE FROM trade_edges WHERE mode=? AND a=? AND b=?", (mode, a, b))
-        _tombstone('edge', _edge_ref(mode, a, b))
-        _conn.commit()
+    if edge(mode, a, b) is None:
+        raise MapError('no_edge')
+    _exec("DELETE FROM trade_edges WHERE mode=? AND a=? AND b=?", (mode, a, b))
+    _tombstone('edge', _edge_ref(mode, a, b))
     _invalidate()
+
+
+def _require_node(nid):
+    rows = _q("SELECT id, mode, kind, home, builtin FROM trade_nodes WHERE id=?", (nid,))
+    if not rows:
+        raise MapError('unknown_node')
+    return rows[0]
